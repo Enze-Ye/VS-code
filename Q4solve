@@ -1,106 +1,138 @@
-import sys
-import os
-import math
-import csv
+import sys, os, math, csv
 
-#Alphabet & basic setup (space + A..Z)
+# Alphabet & helpers (space + A..Z)
 ALPH = " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-IDX  = {c: i for i, c in enumerate(ALPH)}
+IDX  = {c:i for i,c in enumerate(ALPH)}
 V    = len(ALPH)
 
-
-#Helpers (XOR, byte->symbol index)
 def bxor(a: bytes, b: bytes) -> bytes:
+    # bytewise XOR
     return bytes([x ^ y for x, y in zip(a, b)])
 
 def to_sym(b: int) -> int:
-    if b == 32:
-        return 0
-    if 65 <= b <= 90:
-        return b - 64
-    if 97 <= b <= 122:
-        return b - 96
+    # map byte to {space(0), A..Z(1..26); others -> space}
+    if b == 32: return 0
+    if 65 <= b <= 90:  return b - 64
+    if 97 <= b <= 122: return b - 96
     return 0
 
+def load_lang_from_csv(path: str):
+    # parse bigram CSV rows; ignore headers; derive unigram by column sums; Laplace(+1) -> log
+    big_counts = [[0.0]*V for _ in range(V)]
+    seen       = [False]*V
 
-#Load unigram table (first row of CSV)
-def load_unigram_log(csv_path: str):
-    with open(csv_path, newline="") as f:
-        row = next(csv.reader(f))
-    vals = []
-    for cell in row:
-        cell = cell.strip()
-        if not cell:
-            continue
-        try:
-            vals.append(float(cell))
-        except ValueError:
-            pass
-    if len(vals) < V:
-        raise ValueError("ftable2.csv first row must have 27 numbers (space + A..Z)")
-    vals  = vals[:V]
-    total = sum(vals)
-    # Laplace(+1) smoothing -> log-probability
-    return [math.log((c + 1.0) / (total + V)) for c in vals]
+    with open(path, newline="") as f:
+        rdr = csv.reader(f)
+        for row in rdr:
+            if not row: 
+                continue
+            label = (row[0] or "").strip()
+            if label == "":
+                continue
+            ch = " " if label == " " else label[0].upper()
+            fi = IDX.get(ch, None)
+            if fi is None:
+                continue
+            vals = []
+            for cell in row[1:]:
+                cell = (cell or "").strip()
+                if not cell: 
+                    continue
+                try:
+                    vals.append(float(cell))
+                except ValueError:
+                    pass
+            if len(vals) >= V:
+                big_counts[fi] = vals[:V]
+                seen[fi] = True
 
+    if sum(seen) == 0:
+        raise ValueError("Could not parse any bigram rows from ftable2.csv")
 
-#English scoring (unigram log-score)
-def english_log_score_unigram(bs: bytes, log_uni):
-    s = 0.0
-    for b in bs:
-        s += log_uni[to_sym(b)]
+    # derive unigram by summing columns
+    uni_counts = [0.0]*V
+    for fi in range(V):
+        for ni in range(V):
+            uni_counts[ni] += big_counts[fi][ni]
+
+    # Laplace(+1) smoothing -> log-probs
+    total_uni = sum(uni_counts)
+    log_uni = [math.log((c + 1.0) / (total_uni + V)) for c in uni_counts]
+
+    log_big = [[0.0]*V for _ in range(V)]
+    for fi in range(V):
+        row_total = sum(big_counts[fi])
+        for ni in range(V):
+            p = (big_counts[fi][ni] + 1.0) / (row_total + V)
+            log_big[fi][ni] = math.log(p)
+
+    return log_uni, log_big
+
+def english_log_score(bs: bytes, log_uni, log_big) -> float:
+    # unigram+bigram log-score
+    syms = [to_sym(b) for b in bs]
+    if not syms: 
+        return -1e99
+    s = log_uni[syms[0]]
+    for i in range(1, len(syms)):
+        s += log_big[syms[i-1]][syms[i]]
     return s
 
-
-#Main
 def main():
+    # CLI: CT_BIN (2048B), DB_DIR, FTABLE_CSV
     if len(sys.argv) != 4:
         print(f"Usage: {sys.argv[0]} CT_BIN DB_DIR FTABLE_CSV", file=sys.stderr)
         sys.exit(1)
 
-    ct_path   = sys.argv[1]
-    db_dir    = sys.argv[2]
-    csv_path  = sys.argv[3]
+    ct_path, db_dir, csv_path = sys.argv[1], sys.argv[2], sys.argv[3]
 
+    # read ciphertexts
     data = open(ct_path, "rb").read()
     if len(data) != 2048:
-        print("Error: ct.bin must be exactly 2048 bytes.", file=sys.stderr)
+        print("Error: CT_BIN must be exactly 2048 bytes.", file=sys.stderr)
         sys.exit(2)
+    c1, c2 = data[:1024], data[1024:]
+    x = bxor(c1, c2)  # x = f_i ⊕ e
 
-    c1 = data[:1024]
-    c2 = data[1024:]
-    x  = bxor(c1, c2)  # x = f_i ⊕ e
+    # load language model
+    log_uni, log_big = load_lang_from_csv(csv_path)
 
-    log_uni = load_unigram_log(csv_path)
-
+    # enumerate DB candidates (size==1024)
     best = None  # (score, path, e_plain, f_plain)
     for name in sorted(os.listdir(db_dir)):
         p = os.path.join(db_dir, name)
-        if not os.path.isfile(p) or os.stat(p).st_size != 1024:
+        try:
+            st = os.stat(p)
+        except FileNotFoundError:
             continue
-        f_plain = open(p, "rb").read()
+        if not os.path.isfile(p) or st.st_size != 1024:
+            continue
+        with open(p, "rb") as fh:
+            f_plain = fh.read()
         e_plain = bxor(x, f_plain)
-        score   = english_log_score_unigram(e_plain, log_uni)
-        if best is None or score > best[0]:
+        score   = english_log_score(e_plain, log_uni, log_big)
+        if (best is None) or (score > best[0]):
             best = (score, p, e_plain, f_plain)
 
     if best is None:
-        print("No 1024-byte candidates in DB directory.", file=sys.stderr)
+        print("No 1024-byte DB candidates found.", file=sys.stderr)
         sys.exit(3)
 
     score, fpath, e_plain, f_plain = best
-    print(f"[+] Chosen DB file: {fpath}")
-    print(f"[+] English score (unigram): {score:.2f}")
+    print(f"[+] DB match: {fpath}")
+    print(f"[+] English score: {score:.2f}")
 
+    # recover pad and verify
     pad1 = bxor(c1, f_plain)
     pad2 = bxor(c2, e_plain)
     if pad1 != pad2:
-        print("Error: pad mismatch (check inputs and lengths).", file=sys.stderr)
+        print("Error: pad mismatch (check inputs).", file=sys.stderr)
         sys.exit(4)
 
-    open("plain_db.bin",       "wb").write(f_plain)
-    open("plain_english.txt",  "wb").write(e_plain)
-    open("pad.bin",            "wb").write(pad1)
+    # write outputs
+    open("plain_db.bin",      "wb").write(f_plain)
+    open("plain_english.txt", "wb").write(e_plain)
+    open("pad.bin",           "wb").write(pad1)
     print("[+] Wrote plain_db.bin, plain_english.txt, pad.bin")
 
 if __name__ == "__main__":
