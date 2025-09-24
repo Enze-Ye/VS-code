@@ -1,0 +1,107 @@
+import sys
+import os
+import math
+import csv
+
+#Alphabet & basic setup (space + A..Z)
+ALPH = " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+IDX  = {c: i for i, c in enumerate(ALPH)}
+V    = len(ALPH)
+
+
+#Helpers (XOR, byte->symbol index)
+def bxor(a: bytes, b: bytes) -> bytes:
+    return bytes([x ^ y for x, y in zip(a, b)])
+
+def to_sym(b: int) -> int:
+    if b == 32:
+        return 0
+    if 65 <= b <= 90:
+        return b - 64
+    if 97 <= b <= 122:
+        return b - 96
+    return 0
+
+
+#Load unigram table (first row of CSV)
+def load_unigram_log(csv_path: str):
+    with open(csv_path, newline="") as f:
+        row = next(csv.reader(f))
+    vals = []
+    for cell in row:
+        cell = cell.strip()
+        if not cell:
+            continue
+        try:
+            vals.append(float(cell))
+        except ValueError:
+            pass
+    if len(vals) < V:
+        raise ValueError("ftable2.csv first row must have 27 numbers (space + A..Z)")
+    vals  = vals[:V]
+    total = sum(vals)
+    # Laplace(+1) smoothing -> log-probability
+    return [math.log((c + 1.0) / (total + V)) for c in vals]
+
+
+#English scoring (unigram log-score)
+def english_log_score_unigram(bs: bytes, log_uni):
+    s = 0.0
+    for b in bs:
+        s += log_uni[to_sym(b)]
+    return s
+
+
+#Main
+def main():
+    if len(sys.argv) != 4:
+        print(f"Usage: {sys.argv[0]} CT_BIN DB_DIR FTABLE_CSV", file=sys.stderr)
+        sys.exit(1)
+
+    ct_path   = sys.argv[1]
+    db_dir    = sys.argv[2]
+    csv_path  = sys.argv[3]
+
+    data = open(ct_path, "rb").read()
+    if len(data) != 2048:
+        print("Error: ct.bin must be exactly 2048 bytes.", file=sys.stderr)
+        sys.exit(2)
+
+    c1 = data[:1024]
+    c2 = data[1024:]
+    x  = bxor(c1, c2)  # x = f_i ⊕ e
+
+    log_uni = load_unigram_log(csv_path)
+
+    best = None  # (score, path, e_plain, f_plain)
+    for name in sorted(os.listdir(db_dir)):
+        p = os.path.join(db_dir, name)
+        if not os.path.isfile(p) or os.stat(p).st_size != 1024:
+            continue
+        f_plain = open(p, "rb").read()
+        e_plain = bxor(x, f_plain)
+        score   = english_log_score_unigram(e_plain, log_uni)
+        if best is None or score > best[0]:
+            best = (score, p, e_plain, f_plain)
+
+    if best is None:
+        print("No 1024-byte candidates in DB directory.", file=sys.stderr)
+        sys.exit(3)
+
+    score, fpath, e_plain, f_plain = best
+    print(f"[+] Chosen DB file: {fpath}")
+    print(f"[+] English score (unigram): {score:.2f}")
+
+    pad1 = bxor(c1, f_plain)
+    pad2 = bxor(c2, e_plain)
+    if pad1 != pad2:
+        print("Error: pad mismatch (check inputs and lengths).", file=sys.stderr)
+        sys.exit(4)
+
+    open("plain_db.bin",       "wb").write(f_plain)
+    open("plain_english.txt",  "wb").write(e_plain)
+    open("pad.bin",            "wb").write(pad1)
+    print("[+] Wrote plain_db.bin, plain_english.txt, pad.bin")
+
+if __name__ == "__main__":
+    main()
